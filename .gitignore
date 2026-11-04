@@ -1,0 +1,18 @@
+# Export output
+export/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Session / auth
+*.session
+*.auth
+*.token
+
+# Logs
+*.log
+
+# Env files
+.env
