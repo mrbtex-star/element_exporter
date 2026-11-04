@@ -16,3 +16,6 @@ __pycache__/
 
 # Env files
 .env
+
+# Local state
+checkpoints.sqlite
