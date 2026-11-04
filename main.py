@@ -23,6 +23,7 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, TypedDict
@@ -36,6 +37,8 @@ DEFAULT_CONFIG = "config.ini"
 EXPORT_ROOT = Path("export")
 DEFAULT_HOMESERVER = "https://matrix.org"
 CHECKPOINT_DB = "checkpoints.sqlite"
+MAX_RETRY_COUNT = 5               # max retries on 429/5xx
+CONCURRENT_MEDIA_LIMIT = 5        # parallel media downloads
 
 
 # ── Checkpoint Database ───────────────────────────────────────────────────
@@ -123,38 +126,46 @@ class CheckpointDB:
     def mark_room_running(self, room_id: str, room_name: str,
                           total_messages: int, total_media: int,
                           total_size: int) -> None:
-        self.save_room(room_id, room_name, "running",
-                       total_messages, total_media, 0, 0, total_size)
+        with self.conn:
+            self.save_room(room_id, room_name, "running",
+                           total_messages, total_media, 0, 0, total_size)
 
     def update_progress(self, room_id: str, messages_done: int,
                         media_done: int) -> None:
-        self.conn.execute(
-            "UPDATE rooms SET messages_done=?, media_done=? WHERE room_id=?",
-            (messages_done, media_done, room_id)
-        )
-        self.conn.commit()
+        with self.conn:  # atomic transaction
+            self.conn.execute(
+                "UPDATE rooms SET messages_done=?, media_done=? WHERE room_id=?",
+                (messages_done, media_done, room_id)
+            )
 
     def complete_room(self, room_id: str, messages_done: int,
                       media_done: int, total_size: int) -> None:
-        self.save_room(room_id, "", "finished", 0, 0,
-                       messages_done, media_done, total_size)
+        with self.conn:  # atomic transaction — all-or-nothing
+            now = datetime.now(timezone.utc).isoformat()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO rooms "
+                "(room_id, room_name, state, total_messages, total_media, "
+                "messages_done, media_done, total_size, started_at, finished_at, error) "
+                "VALUES (?, ?, 'finished', 0, 0, ?, ?, ?, ?, ?, ?)",
+                (room_id, "", messages_done, media_done, total_size, now, now, None)
+            )
 
     def skip_room(self, room_id: str, reason: str) -> None:
-        self.conn.execute(
-            "UPDATE rooms SET state='skipped', error=? WHERE room_id=?",
-            (reason, room_id)
-        )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE rooms SET state='skipped', error=? WHERE room_id=?",
+                (reason, room_id)
+            )
 
     def mark_message_done(self, room_id: str, event_id: str,
                           msg_type: str, subtype: str) -> None:
-        self.conn.execute(
-            """INSERT INTO messages (room_id, event_id, msg_type, subtype, state)
-               VALUES (?, ?, ?, ?, 'exported')
-               ON CONFLICT(event_id) DO UPDATE SET state='exported'""",
-            (room_id, event_id, msg_type, subtype)
-        )
-        self.conn.commit()
+        with self.conn:  # atomic insert-or-nothing
+            self.conn.execute(
+                """INSERT INTO messages (room_id, event_id, msg_type, subtype, state)
+                   VALUES (?, ?, ?, ?, 'exported')
+                   ON CONFLICT(event_id) DO UPDATE SET state='exported'""",
+                (room_id, event_id, msg_type, subtype)
+            )
 
     def is_message_done(self, event_id: str) -> bool:
         row = self.conn.execute(
@@ -166,14 +177,14 @@ class CheckpointDB:
     def mark_media_done(self, room_id: str, media_url: str, file_name: str,
                         file_path: str, media_type: str, size_bytes: int,
                         download_time: float) -> None:
-        self.conn.execute(
-            """INSERT OR REPLACE INTO media_files (room_id, media_url, file_name, file_path,
-              media_type, size_bytes, state, download_time)
-               VALUES (?, ?, ?, ?, ?, ?, 'downloaded', ?)""",
-            (room_id, media_url, file_name, file_path, media_type,
-             size_bytes, download_time)
-        )
-        self.conn.commit()
+        with self.conn:  # atomic upsert
+            self.conn.execute(
+                """INSERT OR REPLACE INTO media_files (room_id, media_url, file_name, file_path,
+                  media_type, size_bytes, state, download_time)
+                   VALUES (?, ?, ?, ?, ?, ?, 'downloaded', ?)""",
+                (room_id, media_url, file_name, file_path, media_type,
+                 size_bytes, download_time)
+            )
 
     def is_media_done(self, media_url: str) -> bool:
         row = self.conn.execute(
@@ -183,13 +194,13 @@ class CheckpointDB:
         return row is not None
 
     def mark_media_error(self, room_id: str, media_url: str, error: str) -> None:
-        self.conn.execute(
-            """INSERT INTO media_files (room_id, media_url, state, error)
-               VALUES (?, ?, 'failed', ?)
-               ON CONFLICT(media_url) DO UPDATE SET state='failed', error=excluded.error""",
-            (room_id, media_url, error)
-        )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO media_files (room_id, media_url, state, error)
+                   VALUES (?, ?, 'failed', ?)
+                   ON CONFLICT(media_url) DO UPDATE SET state='failed', error=excluded.error""",
+                (room_id, media_url, error)
+            )
 
     def get_room_status(self, room_id: str) -> Optional[dict]:
         row = self.conn.execute(
@@ -288,25 +299,92 @@ logging.basicConfig(
 logger = logging.getLogger("element_exporter")
 
 
+# ── Retry helpers ──────────────────────────────────────────────────────────
+
+async def _handle_rate_limit(resp: aiohttp.ClientResponse, backoff_ms: int = 1000) -> bool:
+    """Handle 429/M_LIMIT_EXCEEDED. Returns True if caller should retry.
+    Reads Retry-After header, then retry_after_ms from body, then uses
+    exponential backoff (capped at 5 min)."""
+    if resp.status not in (429, 500, 502, 503, 504):
+        return False
+
+    wait_ms = None
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            wait_ms = int(retry_after)
+            if wait_ms < 100:  # Retry-After is seconds, not ms
+                wait_ms *= 1000
+        except ValueError:
+            pass
+
+    if not wait_ms:
+        try:
+            body = await resp.json()
+            raw = body.get("retry_after_ms")
+            if raw is not None:
+                wait_ms = int(raw)
+        except Exception:
+            pass
+
+    if not wait_ms:
+        wait_ms = min(backoff_ms, 300000)  # cap at 5 minutes
+
+    logger.warning(f"Rate limited (#{resp.status}), retrying in {wait_ms/1000:.1f}s …")
+    await asyncio.sleep(wait_ms / 1000)
+    return True  # signal the caller to retry
+
+
+async def _safe_get(session: aiohttp.ClientSession, url: str, headers: dict, backoff_ms: int = 1000) -> tuple[bool, Optional[aiohttp.ClientResponse]]:
+    """GET with exponential backoff retry on 429/5xx.
+    Returns (ok, response_or_None). ok=False means exhausted retries.
+    On success, the response is returned OPEN (caller must close/read it)."""
+    attempt = 0
+    while attempt < MAX_RETRY_COUNT:
+        try:
+            resp = await session.get(url, headers=headers)
+            if resp.status == 200:
+                return True, resp  # caller owns the response now
+            retry = await _handle_rate_limit(resp, backoff_ms)
+            if retry:
+                attempt += 1
+                backoff_ms = min(backoff_ms * 2, 300000)
+                continue
+            # Non-retryable error — return response for caller to inspect
+            return False, resp
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"Network error ({e}), retry {attempt+1}/{MAX_RETRY_COUNT} in {backoff_ms/1000:.1f}s …")
+            await asyncio.sleep(backoff_ms / 1000)
+            attempt += 1
+            backoff_ms = min(backoff_ms * 2, 300000)
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error on {url}: {e}")
+            return False, None
+    logger.error(f"Exhausted {MAX_RETRY_COUNT} retries for {url}")
+    return False, None
+
+
 async def auth_check(homeserver: str, access_token: str) -> bool:
     """Verify credentials by making a simple API call."""
     async with aiohttp.ClientSession() as session:
         headers = {"Authorization": f"Bearer {access_token}"}
-        # Use joined_rooms as the auth check - if we get a 200 with data, it works
         url = f"{homeserver}/_matrix/client/v3/joined_rooms"
-        try:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    count = len(data.get("joined_rooms", []))
-                    logger.info(f"✓ Authenticated successfully! ({count} joined rooms)")
-                    return True
-                else:
-                    text = await resp.text()
-                    logger.error(f"Auth failed: {resp.status} - {text[:200]}")
-                    return False
-        except Exception as e:
-            logger.error(f"Auth check error: {e}")
+        ok, resp = await _safe_get(session, url, headers)
+        if ok and resp:
+            try:
+                data = await resp.json()
+            finally:
+                resp.close()
+            count = len(data.get("joined_rooms", []))
+            logger.info(f"✓ Authenticated successfully! ({count} joined rooms)")
+            return True
+        else:
+            text = await resp.text() if resp else "no response"
+            if resp: resp.close()
+            logger.error(f"Auth failed: status={resp.status if resp else 'N/A'} - {text[:200]}")
             return False
 
 
@@ -315,22 +393,22 @@ async def auth_check(homeserver: str, access_token: str) -> bool:
 async def list_rooms(homeserver: str, access_token: str, verbose: bool = False) -> list[dict]:
     """List all joined rooms from the Matrix account using direct API calls."""
     rooms = []
-    
+
     async with aiohttp.ClientSession() as session:
         headers = {"Authorization": f"Bearer {access_token}"}
-        
+
         # Get joined rooms
         url = f"{homeserver}/_matrix/client/v3/joined_rooms"
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                logger.error(f"Failed to get joined rooms: {resp.status}")
-                return []
-            data = await resp.json()
-            room_ids = data.get("joined_rooms", [])
-        
+        ok, resp = await _safe_get(session, url, headers)
+        if not ok or resp.status != 200:
+            logger.error(f"Failed to get joined rooms: {resp.status if resp else 'error'}")
+            return []
+        data = await resp.json()
+        room_ids = data.get("joined_rooms", [])
+
         if verbose:
             logger.info(f"Found {len(room_ids)} joined rooms")
-        
+
         # Get room info for each room in parallel (batches of 50)
         for i in range(0, len(room_ids), 50):
             batch = room_ids[i:i+50]
@@ -341,50 +419,52 @@ async def list_rooms(homeserver: str, access_token: str, verbose: bool = False) 
                     logger.warning(f"Error fetching room info: {r}")
                 elif r:
                     rooms.append(r)
-        
+
         return rooms
 
 
 async def get_room_info(session: aiohttp.ClientSession, headers: dict, homeserver: str, room_id: str) -> Optional[dict]:
-    """Get room info in parallel."""
+    """Get room info in parallel with retry and URL-encoded room_id."""
     room_data = {
         "room_id": room_id,
         "name": room_id,
         "topic": "",
         "member_count": 0,
     }
-    
+
+    encoded_room_id = urllib.parse.quote(room_id, safe='')
+
     try:
-        url = f"{homeserver}/_matrix/client/v3/rooms/{room_id}/state/m.room.name"
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                name_data = await resp.json()
-                name = name_data.get("name", "")
-                if name:
-                    room_data["name"] = name
+        url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/state/m.room.name"
+        ok, resp = await _safe_get(session, url, headers)
+        if ok and resp.status == 200:
+            name_data = await resp.json()
+            name = name_data.get("name", "")
+            if name:
+                room_data["name"] = name
     except Exception:
         pass
-    
+
     try:
-        url = f"{homeserver}/_matrix/client/v3/rooms/{room_id}/state/m.room.topic"
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                topic_data = await resp.json()
-                topic = topic_data.get("body", "")
-                if topic:
-                    room_data["topic"] = topic
+        url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/state/m.room.topic"
+        ok, resp = await _safe_get(session, url, headers)
+        if ok and resp.status == 200:
+            topic_data = await resp.json()
+            topic = topic_data.get("body", "")
+            if topic:
+                room_data["topic"] = topic
     except Exception:
         pass
-    
+
     try:
-        url = f"{homeserver}/_matrix/client/v3/joined_members/{room_id}"
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                members_data = await resp.json()
-                room_data["member_count"] = len(members_data.get("joined_members", []))
+        url = f"{homeserver}/_matrix/client/v3/joined_members/{encoded_room_id}"
+        ok, resp = await _safe_get(session, url, headers)
+        if ok and resp.status == 200:
+            members_data = await resp.json()
+            room_data["member_count"] = len(members_data.get("joined_members", []))
     except Exception:
         pass
-    
+
     return room_data
 
 
@@ -409,6 +489,7 @@ async def print_room_list(rooms: list[dict]):
 # ── Message Export ─────────────────────────────────────────────────────────
 
 async def export_room_messages(
+    session: aiohttp.ClientSession,
     cp: CheckpointDB,
     homeserver: str,
     access_token: str,
@@ -418,11 +499,12 @@ async def export_room_messages(
     limit: int = 0,  # 0 = no limit
     media: bool = False,
     verbose: bool = False,
+    media_semaphore: Optional[asyncio.Semaphore] = None,
 ) -> Path:
     """
     Export all messages from a room using direct API calls with checkpoint/resume.
     Downloads media files if media=True, tracking progress and skipping already-downloaded files.
-    Returns the path to the export file.
+    Uses session from caller (no new session created per room).
     """
     export_dir = EXPORT_ROOT / sanitize_filename(room_name)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -433,78 +515,98 @@ async def export_room_messages(
     total_downloaded = 0
     total_size_downloaded = 0
 
-    # Check if room was previously running - resume from checkpoint if possible
+    # Check if room was previously running — resume from checkpoint if possible
     cp_status = cp.get_room_status(room_id)
     if cp_status and cp_status.get("state") in ("running", "skipped"):
         logger.info(f"  Resuming room from checkpoint (previously {cp_status.get('state')})")
 
     iteration = 0
-    async with aiohttp.ClientSession() as session:
-        headers = {"Authorization": f"Bearer {access_token}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
+    encoded_room_id = urllib.parse.quote(room_id, safe='')
 
-        while True:
-            iteration += 1
-            logger.info(f"Fetching messages for {room_name} (page {iteration})...")
+    while True:
+        iteration += 1
+        logger.info(f"Fetching messages for {room_name} (page {iteration})…")
+
+        try:
+            params = {
+                "from": start_key if start_key else "",
+                "limit": "100",
+                "dir": "b",
+            }
+            url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/messages"
+            ok, resp = await _safe_get(session, url, headers)
+
+            if not ok or resp is None or resp.status != 200:
+                if resp and resp.status == 400:
+                    try:
+                        err = await resp.json()
+                        if err.get("errcode") == "M_INVALID_PARAM":
+                            logger.info("Pagination token expired, stopping pagination.")
+                    except Exception:
+                        pass
+                if resp:
+                    try:
+                        text = await resp.text()
+                    except Exception:
+                        text = "read error"
+                    finally:
+                        resp.close()
+                else:
+                    text = "no response"
+                logger.error(f"Error fetching messages: {resp.status if resp else 'error'} — {text[:200]}")
+                break
 
             try:
-                params = {
-                    "from": start_key if start_key else "",
-                    "limit": "100",
-                    "dir": "b",
-                }
-                url = f"{homeserver}/_matrix/client/v3/rooms/{room_id}/messages"
-                async with session.get(url, headers=headers, params=params) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        logger.error(f"Error fetching messages: {resp.status} - {text[:200]}")
-                        break
-                    data = await resp.json()
-            except Exception as e:
-                logger.error(f"Error fetching messages: {e}")
-                break
+                data = await resp.json()
+            finally:
+                resp.close()
+        except Exception as e:
+            logger.error(f"Error fetching messages: {e}")
+            break
 
-            chunk = data.get("chunk", [])
-            end_key = data.get("end")
-            start_key = data.get("end")
+        chunk = data.get("chunk", [])
+        end_key = data.get("end")
+        start_key = data.get("end")
 
-            if not chunk:
-                if verbose:
-                    logger.info("No more messages.")
-                break
-
-            if not end_key:
-                if verbose:
-                    logger.info("Reached earliest message.")
-                break
-
-            # Count messages in this batch for progress
-            batch_size = len(chunk)
-            for event in chunk:
-                msg_info = await extract_message_info(
-                    event, room_name, media, export_dir,
-                    homeserver, access_token, session, cp
-                )
-                if msg_info:
-                    messages.append(msg_info)
-                    if msg_info.get("file_path"):
-                        media_files_info.append(msg_info)
-
-            msg_count = len(messages)
-            if limit and msg_count >= limit:
-                messages = messages[:limit]
-                media_files_info = [m for m in media_files_info if m["event_id"] in {m2["event_id"] for m2 in messages}]
-                logger.info(f"Reached limit of {limit} messages.")
-                break
-
+        if not chunk:
             if verbose:
-                logger.info(f"  Fetched {msg_count} messages so far...")
+                logger.info("No more messages.")
+            break
 
-            # Update checkpoint progress periodically
-            media_so_far = sum(1 for m in media_files_info if m.get("_downloaded"))
-            cp.update_progress(room_id, msg_count, media_so_far)
+        if not end_key:
+            if verbose:
+                logger.info("Reached earliest message.")
+            break
 
-        # Sort by timestamp (oldest first)
-        messages.sort(key=lambda m: m.get("timestamp", 0))
+        # Count messages in this batch for progress
+        batch_size = len(chunk)
+        for event in chunk:
+            msg_info = await extract_message_info(
+                event, room_name, media, export_dir,
+                homeserver, access_token, session, cp, media_semaphore
+            )
+            if msg_info:
+                messages.append(msg_info)
+                if msg_info.get("file_path"):
+                    media_files_info.append(msg_info)
+
+        msg_count = len(messages)
+        if limit and msg_count >= limit:
+            messages = messages[:limit]
+            media_files_info = [m for m in media_files_info if m["event_id"] in {m2["event_id"] for m2 in messages}]
+            logger.info(f"Reached limit of {limit} messages.")
+            break
+
+        if verbose:
+            logger.info(f"  Fetched {msg_count} messages so far…")
+
+        # Update checkpoint progress periodically
+        media_so_far = sum(1 for m in media_files_info if m.get("_downloaded"))
+        cp.update_progress(room_id, msg_count, media_so_far)
+
+    # Sort by timestamp (oldest first)
+    messages.sort(key=lambda m: m.get("timestamp", 0))
 
     # Compute total media size from exported info
     total_size = sum(m.get("file_info", {}).get("size", 0) for m in media_files_info)
@@ -539,7 +641,8 @@ async def export_room_messages(
 async def extract_message_info(
     event, room_name: str, media: bool,
     export_dir: Path, homeserver: str, access_token: str,
-    session: aiohttp.ClientSession, cp: CheckpointDB
+    session: aiohttp.ClientSession, cp: CheckpointDB,
+    media_semaphore: Optional[asyncio.Semaphore] = None,
 ) -> Optional[dict]:
     """Extract message info from a Matrix event dict. Downloads media if needed."""
     msg_type = event.get("type", "")
@@ -597,7 +700,8 @@ async def extract_message_info(
             url = content["url"]
             downloaded_path = await download_media(
                 url, body, info,
-                export_dir, msg_subtype, homeserver, access_token, cp, event_id
+                export_dir, msg_subtype, homeserver, access_token, cp, event_id,
+                session, media_semaphore
             )
             if downloaded_path:
                 msg_info["file_path"] = str(downloaded_path)
@@ -616,75 +720,108 @@ async def download_media(
     access_token: str,
     cp: CheckpointDB,
     event_id: str,
+    session: aiohttp.ClientSession,  # from caller — reused
+    semaphore: Optional[asyncio.Semaphore] = None,  # controls concurrency
 ) -> Optional[Path]:
     """
     Download a media file from a Matrix media server with checkpoint tracking.
     Skips if already downloaded.
+    Uses session from caller (no new session per download).
+    Retries on rate limits with exponential backoff.
+    URL-encodes the mxc path segments for safety.
+    Uses v3 download endpoint (current spec recommendation).
+    Respects concurrency semaphore.
     """
     # Skip if already downloaded
     if cp.is_media_done(url):
         return None
 
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            start_time = time.time()
+        start_time = time.time()
 
-            # Convert mxc:// URL to HTTP download URL
+        # Convert mxc:// URL to HTTP download URL (v3 endpoint)
+        mxc_host = ""
+        mxc_file = ""
+        if url.startswith("mxc://"):
+            parts = url[6:].split("/", 1)
+            if len(parts) == 2:
+                mxc_host = parts[0]
+                mxc_file = parts[1]
+                # URL-encode path segments for safety
+                mxc_host_enc = urllib.parse.quote(mxc_host, safe='')
+                mxc_file_enc = urllib.parse.quote(mxc_file, safe='')
+                download_url = f"{homeserver}/_matrix/media/v3/download/{mxc_host_enc}/{mxc_file_enc}"
+            else:
+                download_url = url  # fallback
+        else:
             download_url = url
-            if url.startswith("mxc://"):
-                # Extract host and file ID from mxc://host/file
-                parts = url[6:].split("/", 1)
-                if len(parts) == 2:
-                    mxc_host, mxc_file = parts
-                    download_url = f"{homeserver}/_matrix/media/r0/download/{mxc_host}/{mxc_file}"
 
-            async with session.get(download_url, headers=headers) as resp:
-                if resp.status != 200:
-                    cp.mark_media_error(event_id or "", url, f"status {resp.status}")
-                    logger.warning(
-                        f"Media unavailable: {url[:60]}... "
-                        f"(status {resp.status}, may be private room)"
-                    )
-                    return None
+        backoff_ms = 1000
 
-                content = await resp.read()
-                elapsed = time.time() - start_time
+        async def _fetch():
+            nonlocal backoff_ms  # must be first thing in function
+            """Single fetch attempt with retry loop."""
+            while True:
+                async with session.get(download_url, headers={"Authorization": f"Bearer {access_token}"}) as resp:
+                    if resp.status == 200:
+                        return True, resp
+                    retry = await _handle_rate_limit(resp, backoff_ms)
+                    if retry:
+                        backoff_ms = min(backoff_ms * 2, 300000)
+                        continue
+                    return False, resp
 
-                # Determine file extension from info or content-type
-                ext = ""
-                if info and "mimetype" in info:
-                    mime = info["mimetype"]
-                    ext_map = {
-                        "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
-                        "image/webp": ".webp", "video/mp4": ".mp4", "video/webm": ".webm",
-                        "audio/mp3": ".mp3", "audio/ogg": ".ogg", "audio/wav": ".wav",
-                        "audio/mpeg": ".mp3", "application/pdf": ".pdf", "application/zip": ".zip",
-                    }
-                    ext = ext_map.get(mime, "")
+        if semaphore:
+            async with semaphore:
+                ok, resp = await _fetch()
+        else:
+            ok, resp = await _fetch()
 
-                if not ext:
-                    for e in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm", ".mp3", ".ogg", ".pdf", ".zip"]:
-                        if e in filename.lower():
-                            ext = e
-                            break
+        if not ok or resp is None:
+            cp.mark_media_error(event_id or "", url, f"status {resp.status if resp else 'error'}")
+            logger.warning(
+                f"Media unavailable: {url[:60]}… "
+                f"(may be private room)"
+            )
+            return None
 
-                safe_name = sanitize_filename(filename or f"media_{int(time.time())}{ext}")
-                media_path = export_dir / safe_name
+        content = await resp.read()
+        elapsed = time.time() - start_time
 
-                media_path.write_bytes(content)
+        # Determine file extension from info or content-type
+        ext = ""
+        if info and "mimetype" in info:
+            mime = info["mimetype"]
+            ext_map = {
+                "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                "image/webp": ".webp", "video/mp4": ".mp4", "video/webm": ".webm",
+                "audio/mp3": ".mp3", "audio/ogg": ".ogg", "audio/wav": ".wav",
+                "audio/mpeg": ".mp3", "application/pdf": ".pdf", "application/zip": ".zip",
+            }
+            ext = ext_map.get(mime, "")
 
-                # Record in checkpoint
-                cp.mark_media_done(
-                    event_id, url, safe_name, str(media_path),
-                    media_type, len(content), elapsed
-                )
+        if not ext:
+            for e in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm", ".mp3", ".ogg", ".pdf", ".zip"]:
+                if e in filename.lower():
+                    ext = e
+                    break
 
-                logger.info(
-                    f"  Downloaded {media_type}: {media_path.name} "
-                    f"({len(content):,} bytes, {elapsed:.1f}s)"
-                )
-                return media_path
+        safe_name = sanitize_filename(filename or f"media_{int(time.time())}{ext}")
+        media_path = export_dir / safe_name
+
+        media_path.write_bytes(content)
+
+        # Record in checkpoint
+        cp.mark_media_done(
+            event_id, url, safe_name, str(media_path),
+            media_type, len(content), elapsed
+        )
+
+        logger.info(
+            f"  Downloaded {media_type}: {media_path.name} "
+            f"({len(content):,} bytes, {elapsed:.1f}s)"
+        )
+        return media_path
 
     except Exception as e:
         logger.error(f"Failed to download media {url}: {e}")
@@ -841,7 +978,7 @@ async def main(args):
                 print(f"  {name:<40} {r.get('state', '?'):<10} "
                       f"{r.get('messages_done', 0):>6} {r.get('media_done', 0):>6}")
             if len(rooms) > 30:
-                print(f"\n  ... and {len(rooms) - 30} more rooms")
+                print(f"\n  … and {len(rooms) - 30} more rooms")
         print(f"\n{'='*70}\n")
         cp.close()
         return
@@ -868,75 +1005,110 @@ async def main(args):
         print(f"  Total size:        {format_size(summary['total_size_bytes'])}")
         print(f"{'='*70}\n")
 
-    # List rooms (this will fail with auth error if credentials are wrong)
-    logger.info("Fetching joined rooms...")
-    rooms = await list_rooms(homeserver_url, access_token, verbose=args.verbose)
+    # Create ONE aiohttp session shared by ALL work (connection pooling)
+    connector = aiohttp.TCPConnector(limit=50, force_close=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        headers = {"Authorization": f"Bearer {access_token}"}
 
-    if not rooms:
-        logger.warning("No joined rooms found.")
-        return
+        # List rooms with _safe_get (retries rate limits)
+        logger.info("Fetching joined rooms…")
+        ok, resp = await _safe_get(session, f"{homeserver_url}/_matrix/client/v3/joined_rooms", headers)
+        if not ok or resp is None or resp.status != 200:
+            logger.error("Failed to authenticate or fetch rooms.")
+            cp.close()
+            return
+        try:
+            data = await resp.json()
+        finally:
+            resp.close()
+        room_ids = data.get("joined_rooms", [])
 
-    # Print room list if --list-rooms
-    if args.list_rooms:
-        await print_room_list(rooms)
-        if not args.export_all:
+        if not room_ids:
+            logger.warning("No joined rooms found.")
+            cp.close()
             return
 
-    # Determine target rooms
-    if args.room:
-        target_rooms = [r for r in rooms
-                       if args.room.lower() in r["room_id"].lower()
-                       or args.room.lower() in r.get("name", "").lower()]
-        if not target_rooms:
-            target_rooms = [{"room_id": args.room, "name": args.room, "topic": "", "member_count": 0}]
-    else:
-        target_rooms = rooms
+        if len(room_ids) > 0:
+            logger.info(f"Found {len(room_ids)} joined rooms")
 
-    # Export each room with checkpoint tracking and progress
-    total_rooms = len(target_rooms)
-    # Track only current-run progress for the progress bar
-    current_run_progress = 0
+        # Fetch room info in parallel (single session)
+        rooms = []
+        for i in range(0, len(room_ids), 50):
+            batch = room_ids[i:i+50]
+            tasks = [get_room_info(session, headers, homeserver_url, rid) for rid in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.warning(f"Error fetching room info: {r}")
+                elif r:
+                    rooms.append(r)
 
-    for idx, room in enumerate(target_rooms, 1):
-        room_id = room["room_id"]
-        room_name = room.get("name", room_id[:30])
+        # Print room list if --list-rooms
+        if args.list_rooms:
+            await print_room_list(rooms)
+            if not args.export_all:
+                cp.close()
+                return
 
-        # Check if room was previously finished
-        cp_status = cp.get_room_status(room_id)
+        # Determine target rooms
+        if args.room:
+            target_rooms = [r for r in rooms
+                           if args.room.lower() in r["room_id"].lower()
+                           or args.room.lower() in r.get("name", "").lower()]
+            if not target_rooms:
+                target_rooms = [{"room_id": args.room, "name": args.room, "topic": "", "member_count": 0}]
+        else:
+            target_rooms = rooms
 
-        logger.info(f"{'='*70}")
-        logger.info(f"Room {idx}/{total_rooms} | {room_name} ({room_id})")
-        logger.info(f"{'='*70}")
+        # Semaphore to limit concurrent media downloads
+        media_semaphore = asyncio.Semaphore(CONCURRENT_MEDIA_LIMIT) if args.media else None
 
-        if cp_status and cp_status.get("state") == "finished":
-            logger.info(f"✓ Skipped (already exported)")
-            logger.info(f"  {cp_status.get('messages_done', 0)} messages, "
-                       f"{cp_status.get('media_done', 0)} media files\n")
-            continue
+        # Export each room with checkpoint tracking and progress
+        total_rooms = len(target_rooms)
+        # Track only current-run progress for the progress bar
+        current_run_progress = 0
 
-        if cp_status and cp_status.get("state") == "skipped":
-            logger.warning(f"Room was previously skipped: {cp_status.get('error', 'unknown')}")
-            if not args.force:
-                logger.info("Use --force to retry")
+        for idx, room in enumerate(target_rooms, 1):
+            room_id = room["room_id"]
+            room_name = room.get("name", room_id[:30])
+
+            # Check if room was previously finished
+            cp_status = cp.get_room_status(room_id)
+
+            logger.info(f"{'='*70}")
+            logger.info(f"Room {idx}/{total_rooms} | {room_name} ({room_id})")
+            logger.info(f"{'='*70}")
+
+            if cp_status and cp_status.get("state") == "finished":
+                logger.info(f"✓ Skipped (already exported)")
+                logger.info(f"  {cp_status.get('messages_done', 0)} messages, "
+                           f"{cp_status.get('media_done', 0)} media files\n")
                 continue
 
-        try:
-            path = await export_room_messages(
-                cp,
-                homeserver_url, access_token,
-                room_id, room_name,
-                fmt=args.formats, limit=args.limit,
-                media=args.media, verbose=args.verbose,
-            )
-            current_run_progress += 1
+            if cp_status and cp_status.get("state") == "skipped":
+                logger.warning(f"Room was previously skipped: {cp_status.get('error', 'unknown')}")
+                if not args.force:
+                    logger.info("Use --force to retry")
+                    continue
 
-            # Print progress (get live count from checkpoint DB)
-            live_summary = cp.get_checkpoint_summary()
-            print_progress(current_run_progress, total_rooms, live_summary["media_files_downloaded"])
+            try:
+                path = await export_room_messages(
+                    session, cp,
+                    homeserver_url, access_token,
+                    room_id, room_name,
+                    fmt=args.formats, limit=args.limit,
+                    media=args.media, verbose=args.verbose,
+                    media_semaphore=media_semaphore,
+                )
+                current_run_progress += 1
 
-        except Exception as e:
-            logger.error(f"✗ Failed to export {room_name}: {e}")
-            cp.skip_room(room_id, str(e)[:200])
+                # Print progress (get live count from checkpoint DB)
+                live_summary = cp.get_checkpoint_summary()
+                print_progress(current_run_progress, total_rooms, live_summary["media_files_downloaded"])
+
+            except Exception as e:
+                logger.error(f"✗ Failed to export {room_name}: {e}")
+                cp.skip_room(room_id, str(e)[:200])
 
     # Final summary
     final_summary = cp.get_checkpoint_summary()
