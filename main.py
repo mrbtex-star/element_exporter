@@ -591,9 +591,9 @@ async def export_room_messages(
         for event in new_chunk:
             try:
                 msg_info = await extract_message_info(
-                event, room_name, media, export_dir,
-                homeserver, access_token, session, cp, media_semaphore
-            )
+                    event, room_name, media, export_dir,
+                    homeserver, access_token, session, cp, media_semaphore
+                )
             except Exception as e:
                 if verbose:
                     logger.error(f"  Error processing event {event.get('event_id', '?')[:40]}: {e}")
@@ -731,6 +731,7 @@ async def extract_message_info(
             "size": info.get("size", 0),
         }
         msg_info["file_info"] = file_info
+        logger.info(f"  Found media event: {msg_subtype} url={bool(content.get('url'))} media={media}")
 
         # Download media if requested and not already done
         if media and content.get("url"):
@@ -796,33 +797,51 @@ async def download_media(
         backoff_ms = 1000
 
         async def _fetch():
-            nonlocal backoff_ms  # must be first thing in function
-            """Single fetch attempt with retry loop."""
+            """Single fetch attempt with retry loop. Returns (ok, content_bytes, error_msg)."""
             while True:
-                async with session.get(download_url, headers={"Authorization": f"Bearer {access_token}"}) as resp:
+                try:
+                    resp = await session.get(download_url, headers={"Authorization": f"Bearer {access_token}"})
                     if resp.status == 200:
-                        return True, resp
+                        content = await resp.read()
+                        resp.release()
+                        return True, content, None
+                    elif resp.status == 404:
+                        err = await resp.json()
+                        resp.release()
+                        return False, None, err.get('error', resp.reason)
                     retry = await _handle_rate_limit(resp, backoff_ms)
                     if retry:
+                        resp.release()
                         backoff_ms = min(backoff_ms * 2, 300000)
                         continue
-                    return False, resp
+                    err_text = await resp.text()
+                    resp.release()
+                    return False, None, err_text[:100]
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    await asyncio.sleep(backoff_ms / 1000)
+                    backoff_ms = min(backoff_ms * 2, 300000)
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    backoff_ms = min(backoff_ms * 2, 300000)
+                    continue
 
         if semaphore:
             async with semaphore:
-                ok, resp = await _fetch()
+                ok, content, err = await _fetch()
         else:
-            ok, resp = await _fetch()
+            ok, content, err = await _fetch()
 
-        if not ok or resp is None:
-            cp.mark_media_error(event_id or "", url, f"status {resp.status if resp else 'error'}")
+        if not ok or content is None:
+            error_label = f"status {err}" if err else "error"
+            cp.mark_media_error(event_id or "", url, error_label)
             logger.warning(
                 f"Media unavailable: {url[:60]}… "
                 f"(may be private room)"
             )
             return None
 
-        content = await resp.read()
         elapsed = time.time() - start_time
 
         # Determine file extension from info or content-type
