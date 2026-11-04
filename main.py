@@ -512,6 +512,7 @@ async def export_room_messages(
     messages = []
     media_files_info = []
     start_key: Optional[str] = None
+    seen_event_ids: set = set()  # Deduplicate events across pages
     total_downloaded = 0
     total_size_downloaded = 0
 
@@ -535,7 +536,9 @@ async def export_room_messages(
                 "dir": "b",
             }
             url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/messages"
-            ok, resp = await _safe_get(session, url, headers)
+            query_string = urllib.parse.urlencode(params)
+            full_url = f"{url}?{query_string}"
+            ok, resp = await _safe_get(session, full_url, headers)
 
             if not ok or resp is None or resp.status != 200:
                 if resp and resp.status == 400:
@@ -567,7 +570,7 @@ async def export_room_messages(
 
         chunk = data.get("chunk", [])
         end_key = data.get("end")
-        start_key = data.get("end")
+        start_key = data.get("start")  # Fixed: use START for correct backward pagination
 
         if not chunk:
             if verbose:
@@ -579,13 +582,25 @@ async def export_room_messages(
                 logger.info("Reached earliest message.")
             break
 
+        # Deduplicate events by ID (START token may return same events on limited-history rooms)
+        new_chunk = [e for e in chunk if e.get("event_id") not in seen_event_ids]
+        for e in new_chunk:
+            seen_event_ids.add(e["event_id"])
+
         # Count messages in this batch for progress
-        batch_size = len(chunk)
-        for event in chunk:
-            msg_info = await extract_message_info(
+        for event in new_chunk:
+            try:
+                msg_info = await extract_message_info(
                 event, room_name, media, export_dir,
                 homeserver, access_token, session, cp, media_semaphore
             )
+            except Exception as e:
+                if verbose:
+                    logger.error(f"  Error processing event {event.get('event_id', '?')[:40]}: {e}")
+                import traceback
+                if verbose:
+                    traceback.print_exc()
+                continue
             if msg_info:
                 messages.append(msg_info)
                 if msg_info.get("file_path"):
@@ -600,6 +615,15 @@ async def export_room_messages(
 
         if verbose:
             logger.info(f"  Fetched {msg_count} messages so far…")
+
+        # Smart fallback: after page 1, use END token for pagination (some homeservers' START token loops)
+        # Page 1 always uses from="" to get the most recent events
+        if iteration == 1:
+            # First page: use from="" (most recent events)
+            pass
+        else:
+            # Subsequent pages: use END token (START loops on this homeserver)
+            start_key = end_key  # Use END token as from for next page
 
         # Update checkpoint progress periodically
         media_so_far = sum(1 for m in media_files_info if m.get("_downloaded"))
@@ -646,9 +670,18 @@ async def extract_message_info(
 ) -> Optional[dict]:
     """Extract message info from a Matrix event dict. Downloads media if needed."""
     msg_type = event.get("type", "")
-    content = event.get("content", {})
-    msg_subtype = content.get("msgtype", "unknown") if content else "unknown"
-    body = content.get("body", "") if content else ""
+    content = event.get("content") or {}
+    # Message events have msgtype in content; state events (member, create, topic, etc.) do NOT.
+    if msg_type == "m.room.message":
+        msg_subtype = content.get("msgtype", "text")
+        body = content.get("body", "")
+    elif msg_type:
+        # Use event type itself as subtype (e.g., m.room.member, m.room.create)
+        msg_subtype = msg_type
+        body = ""
+    else:
+        msg_subtype = content.get("msgtype", "none") if content else "none"
+        body = content.get("body", "") if content else ""
 
     # Get sender display name
     sender = event.get("sender", "unknown")
@@ -670,8 +703,12 @@ async def extract_message_info(
         "timestamp": ts,
         "ts_str": ts_str,
         "event_id": event.get("event_id", ""),
-        "raw": {},
+        "raw": content,
     }
+
+    # For state events, attach the full content as state_content so the markdown writer can access it
+    if msg_type != "m.room.message" and msg_type:
+        msg_info["state_content"] = {"raw": content}
 
     # Always record message in checkpoint
     event_id = event.get("event_id", "")
@@ -880,8 +917,77 @@ def write_markdown(path: Path, room_name: str, messages: list[dict]):
 
                 f.write("\n")
 
+            elif subtype in ("m.room.member", "m.room.create", "m.room.join_rules",
+                              "m.room.power_levels", "m.room.history_visibility",
+                              "m.room.tombstone"):
+                # State events — show the key content
+                state_raw = msg.get("state_content", {}).get("raw", {})
+                if subtype == "m.room.member":
+                    membership = state_raw.get("membership", "unknown")
+                    prev = state_raw.get("prev_content", {}) or {}
+                    prev_membership = prev.get("membership", "")
+                    reason = state_raw.get("reason", "")
+                    displayname = state_raw.get("displayname", "")
+                    f.write(f"**Membership**: {membership} "
+                            f"{'(was ' + prev_membership + ')' if prev_membership else ''}")
+                    if displayname:
+                        f.write(f"\n  Display name: {displayname}")
+                    if reason:
+                        f.write(f"\n  Reason: {reason}")
+                    f.write("\n")
+                elif subtype == "m.room.create":
+                    f.write(f"**Room created** by {state_raw.get('creator', 'unknown')}")
+                    predecessor = state_raw.get("predecessor", {}) or {}
+                    f.write(f"\n  Predecessor: {predecessor.get('room_id', 'None')}")
+                    f.write(f"\n  Room version: {state_raw.get('room_version', 'default')}\n")
+                elif subtype == "m.room.join_rules":
+                    f.write(f"**Join rules**: {state_raw.get('join_rule', 'unknown')}\n")
+                elif subtype == "m.room.power_levels":
+                    f.write(f"**Power levels**: default={state_raw.get('default', 0)}, "
+                            f"ban={state_raw.get('ban', -1)}\n")
+                elif subtype == "m.room.history_visibility":
+                    f.write(f"**History visibility**: {state_raw.get('history_visibility', 'unknown')}\n")
+                elif subtype == "m.room.tombstone":
+                    f.write(f"**Room replaced by**: {state_raw.get('replacement_room', 'unknown')}\n")
+                f.write("\n")
+
+            elif subtype == "m.room.topic":
+                state_raw = msg.get("state_content", {}).get("raw", {})
+                f.write(f"**Topic**: {state_raw.get('topic', '')}\n")
+                f.write("\n")
+
+            elif subtype == "m.room.name":
+                state_raw = msg.get("state_content", {}).get("raw", {})
+                f.write(f"**Room name**: {state_raw.get('name', '')}\n")
+                f.write("\n")
+
+            elif subtype == "m.room.avatar":
+                state_raw = msg.get("state_content", {}).get("raw", {})
+                url = state_raw.get("url", "set")
+                size = state_raw.get("info", {}).get("size", 0) if state_raw.get("info") else 0
+                f.write(f"**Room avatar**: {url}")
+                f.write(f" ({format_size(size)})\n")
+                f.write("\n")
+
+            elif subtype == "m.room.encryption":
+                state_raw = msg.get("state_content", {}).get("raw", {})
+                f.write(f"**Encryption algorithm**: {state_raw.get('algorithm', '')}\n")
+                f.write("\n")
+
+            elif subtype == "m.room.pinned_events":
+                state_raw = msg.get("state_content", {}).get("raw", {})
+                f.write(f"**Pinned events**: {state_raw.get('pins', [])}\n")
+                f.write("\n")
+
             else:
-                f.write(f"*{subtype} event*\n\n")
+                f.write(f"*{subtype} event*\n")
+                raw_body = msg.get("body", "")
+                if raw_body:
+                    f.write(f"  Body: {raw_body}\n")
+                raw_content = msg.get("state_content", {}).get("raw", {}).get("content", {})
+                if raw_content:
+                    f.write(f"  Content: {dict(list(raw_content.items())[:3])}\n")
+                f.write("\n")
 
             f.write("---\n\n")
 
